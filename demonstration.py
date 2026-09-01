@@ -902,6 +902,276 @@ def range_bytes(reps=REPS):
 
 
 # ===========================================================================
+# 9c.  LNP22 MACHINERY -- what is here, and what is not
+# ===========================================================================
+#
+# The range proof above is stuck with a SCALAR challenge and therefore with
+# repetitions, because b o (b - ONE) = 0 is stated coefficient-wise and
+# (c*b) o (c*b) is not c^2 (b o b) for a ring c.  LNP22 escapes by restating
+# the problem, and this section implements the parts of that machinery that
+# can be built and tested here.
+#
+# WHAT IS HERE
+#
+#   galois / trace.  sigma_j(X) = X^j for odd j is a signed coefficient
+#   permutation, and the full trace Tr(u) = sum_j sigma_j(u) = N * ct(u)
+#   projects R_q onto Z_q exactly (T12).  That is the projection LNP22 needs.
+#
+#   The catch, and it is the whole difficulty: summing a relation over a
+#   subgroup H only behaves if the challenge lies in the subring FIXED by H,
+#   since otherwise sigma_j(c) differs per term and the relation is no longer
+#   uniform in the challenge.  For the full group the fixed subring is Z_q --
+#   the challenge must be a scalar, and we are back where we started.  For
+#   H = {1, sigma_{-1}} the fixed subring has dimension N/2 = 128, which is
+#   ample challenge space, but the projection lands in that 128-dimensional
+#   subring rather than in Z_q, leaving a residue that still needs
+#   gamma-compression.  sigma_fixed_basis() builds that subring.
+#
+#   ct_prove / ct_verify.  A working proof that a COMMITTED m has ct(m) = 0,
+#   by masking with a garbage polynomial g whose constant coefficient is
+#   fixed to zero.  h = x*m + g is opened, the verifier checks ct(h) = 0 and
+#   recomputes C_g from the commitment homomorphism.  The relation is LINEAR
+#   in x, so soundness is 1/XMAX per repetition rather than 2/XMAX, and one
+#   transcript hash covers every repetition so they cannot be ground apart.
+#   This is a genuine LNP22 component and it is sound on its own terms.
+#
+# WHAT IS NOT HERE, AND WHY THE RANGE PROOF STILL COSTS WHAT IT COSTS
+#
+#   LNP22 proves a range by combining ct(<b, b - ONE>) = 0 -- which the
+#   component above can do -- with an EXACT norm bound on b.  Neither alone
+#   suffices: over Z_q the terms of <b, b-ONE> can cancel, so the conclusion
+#   "b is a bit vector" needs the sum taken over the INTEGERS, which needs
+#   ||b|| bounded.  And this construction deliberately has no bound on b:
+#   alpha is uniform mod q precisely so that b extracts EXACTLY, and a
+#   bounded mask would make extraction relaxed by the ring element c - c',
+#   at which point <c'b, c'b> is twisted (T12) and the integer argument
+#   stops typechecking.  Closing that loop is LNP22's exact norm proof and
+#   it is a different construction, not a tuning of this one.
+#
+#   So ct_prove is NOT wired into range_verify.  Wiring a component in and
+#   reducing REPS on the strength of it is exactly the error that made a
+#   2^15 forgery possible earlier in this file's history.
+
+SIGMA = 2 * N - 1                       # sigma_{-1}: X -> X^{-1}
+
+
+def galois(u, j):
+    """sigma_j(u) = u(X^j) for odd j.  A signed coefficient permutation."""
+    u = np.asarray(u, dtype=np.int64)
+    out = np.zeros(N, dtype=np.int64)
+    for i in range(N):
+        e = (i * j) % (2 * N)
+        if e < N:
+            out[e] += u[i]
+        else:
+            out[e - N] -= u[i]
+    return out % Q
+
+
+def trace(u):
+    """sum over the full Galois group.  Equals N * ct(u); verified in T12."""
+    acc = np.zeros(N, dtype=np.int64)
+    for j in range(1, 2 * N, 2):
+        acc = (acc + galois(u, j)) % Q
+    return acc
+
+
+def sigma_fixed_basis():
+    """Basis of the subring fixed by sigma_{-1}: 1, and X^i - X^(N-i)."""
+    out = [E0.copy()]
+    for i in range(1, N // 2):
+        e = np.zeros(N, dtype=np.int64)
+        e[i], e[N - i] = 1, -1
+        out.append(e)
+    return out
+
+
+def ct_prove(r, m, rng, reps=REPS, C=None):
+    """Prove ct(m) = 0 for m committed in C.  One transcript hash over all
+    repetitions, for the reason spelled out in section 9."""
+    C = commit(r, m) if C is None else C
+    tries = 0
+    while True:
+        tries += 1
+        gs, rgs, Cgs = [], [], []
+        for _ in range(reps):
+            g = rng.integers(0, Q, size=N, dtype=np.int64)
+            g[0] = 0                                   # ct(g) = 0 by shape
+            rg = rng.integers(-GR, GR + 1, size=(MU, N), dtype=np.int64)
+            gs.append(g); rgs.append(rg); Cgs.append(commit(rg, g))
+        h = hashlib.sha3_256(b"ct" + enc(C)
+                             + b"".join(enc(c) for c in Cgs)).digest()
+        hp, zs, ok = [], [], True
+        for k in range(reps):
+            x = _x_k(C, h, k)
+            z = x * r + rgs[k]
+            if ninf(z) >= RBOUND:
+                ok = False
+                break
+            hp.append((smallmul(x, m) + gs[k]) % Q)    # smallmul: m is wide
+            zs.append(z)
+        if ok:
+            return {"h": h, "hp": hp, "z": zs, "reps": reps, "tries": tries}
+
+
+def ct_verify(C, pi, reps=REPS):
+    if not isinstance(pi, dict) or pi.get("reps") != reps:
+        return False
+    if not isinstance(pi.get("h"), (bytes, bytearray)) or len(pi["h"]) != 32:
+        return False
+    for k, want in (("hp", reps), ("z", reps)):
+        if k not in pi or len(pi[k]) != want:
+            return False
+    Cgs = []
+    for k in range(reps):
+        hp, z = np.asarray(pi["hp"][k]), np.asarray(pi["z"][k])
+        if hp.shape != (N,) or z.shape != (MU, N):
+            return False
+        if ninf(z) >= RBOUND:
+            return False
+        if int(hp[0]) % Q != 0:                        # ct(h) = 0
+            return False
+        x = _x_k(C, pi["h"], k)
+        Cgs.append((commit(z, hp) - smallmul(x, C)) % Q)
+    return hashlib.sha3_256(b"ct" + enc(C)
+                            + b"".join(enc(c) for c in Cgs)).digest() == pi["h"]
+
+
+
+# --- exact norm proof: <s,s> = wt, with a RING challenge -------------------
+#
+# This is the piece the range proof needs and could not have.  The reason it
+# works where the Hadamard relation does not: sigma(z)*z is a RING product,
+# so with z = c*s + y and sigma(c) = c it expands as
+#
+#     sigma(z)z = c^2 * P  +  c * T1  +  T0,     P = sigma(s)s
+#
+# a genuine quadratic in the ring element c, verified through the commitment
+# homomorphism.  No repetitions: extraction is 3-special-sound over distinct
+# challenges whose pairwise differences are invertible (T01), so the knowledge
+# error is ~3/|C| with |C| >= 2^128.
+#
+# The challenge must lie in the sigma-fixed subring or sigma(c) != c and the
+# expansion above is twisted (T12 shows the twist numerically).  That subring
+# has dimension N/2 = 128, so a 50% zero rate gives exactly 2^-128 min-entropy.
+#
+# ||c^2||_1 is bounded by MEASUREMENT, not by ||c||_1^2: the square of a
+# sparse ternary sigma-fixed challenge has L1 norm ~3.6e3, not 2.9e4, and the
+# verifier recomputes and checks it.  Taking the pessimistic bound costs 19
+# bits on the zt extraction instance.
+
+NORM_L1  = 170                      # cap on ||c||_1   (mean 127.5)
+NORM_L2  = 4996                     # cap on ||c^2||_1 (measured max 3569)
+NG_R = MU * N * NORM_L1 * BETA
+NR_R = NG_R - NORM_L1 * BETA
+NG_T = MU * N * (NORM_L2 + NORM_L1) * BETA
+NR_T = NG_T - (NORM_L2 + NORM_L1) * BETA
+
+
+def sigma_challenge(C, CP, h):
+    """Ternary, sigma-fixed, 50% zero rate -> max Pr[c] = 2^-128."""
+    u = sponge([C, CP], b"nrm" + h)[0] % 4
+    f = (u == 0).astype(np.int64) - (u == 1).astype(np.int64)
+    c = np.zeros(N, dtype=np.int64)
+    c[0] = f[0]
+    for i in range(1, N // 2):
+        c[i] += f[i]
+        c[N - i] -= f[i]
+    return c
+
+
+def _nrm_hash(C, wt, CP, C1, Cy, C0):
+    return hashlib.sha3_256(b"nrm" + enc(C) + int(wt).to_bytes(8, "little")
+                            + enc(CP) + enc(C1) + enc(Cy) + enc(C0)).digest()
+
+
+def norm_prove(r, s, wt, rng, reps=REPS, C=None, max_tries=300):
+    """Prove <s,s> = wt for s committed in C.  Product part is one shot with
+    a ring challenge; the ct(P) = wt step delegates to ct_prove."""
+    C = commit(r, s) if C is None else C
+    P = pmul(sigma(s) % Q, s % Q)
+    rP = rand_r(rng)
+    CP = commit(rP, P)
+    for tries in range(1, max_tries + 1):
+        y = rng.integers(0, Q, size=N, dtype=np.int64)
+        ry = rng.integers(-NG_R, NG_R + 1, size=(MU, N), dtype=np.int64)
+        r1 = rand_r(rng)
+        r0 = rng.integers(-NG_T, NG_T + 1, size=(MU, N), dtype=np.int64)
+        T1 = (pmul(sigma(s) % Q, y) + pmul(sigma(y) % Q, s % Q)) % Q
+        T0 = pmul(sigma(y) % Q, y)
+        Cy, C1, C0 = commit(ry, y), commit(r1, T1), commit(r0, T0)
+        h = _nrm_hash(C, wt, CP, C1, Cy, C0)
+        c = sigma_challenge(C, CP, h)
+        c2 = pmul_tiny(c, c)
+        if l1(c) > NORM_L1 or l1(c2) > NORM_L2:
+            continue
+        z = (pmul(c % Q, s % Q) + y) % Q
+        zr = np.stack([pmul_tiny(c, r[j]) for j in range(MU)]) + ry
+        zt = (np.stack([pmul_tiny(c2, rP[j]) for j in range(MU)])
+              + np.stack([pmul_tiny(c, r1[j]) for j in range(MU)]) + r0)
+        if ninf(zr) < NR_R and ninf(zt) < NR_T:
+            return {"h": h, "CP": CP, "C1": C1, "z": z, "zr": zr, "zt": zt,
+                    "ct": ct_prove(rP, (P - wt * E0) % Q, rng, reps),
+                    "reps": reps, "tries": tries}
+    return None
+
+
+def norm_verify(C, wt, pi, reps=REPS):
+    if not isinstance(pi, dict) or pi.get("reps") != reps:
+        return False
+    for k in ("h", "CP", "C1", "z", "zr", "zt", "ct"):
+        if k not in pi:
+            return False
+    z, zr, zt = np.asarray(pi["z"]), np.asarray(pi["zr"]), np.asarray(pi["zt"])
+    if z.shape != (N,) or zr.shape != (MU, N) or zt.shape != (MU, N):
+        return False
+    if ninf(zr) >= NR_R or ninf(zt) >= NR_T:
+        return False
+    CP, C1 = np.asarray(pi["CP"]), np.asarray(pi["C1"])
+    if CP.shape != (ROWS, N) or C1.shape != (ROWS, N):
+        return False
+    c = sigma_challenge(C, CP, pi["h"])
+    c2 = pmul_tiny(c, c)
+    if l1(c) > NORM_L1 or l1(c2) > NORM_L2:
+        return False
+    if not np.array_equal(galois(c, SIGMA), c % Q):
+        return False
+    cC = np.stack([pmul(c % Q, np.asarray(C)[i]) for i in range(ROWS)])
+    cC1 = np.stack([pmul(c % Q, C1[i]) for i in range(ROWS)])
+    c2CP = np.stack([pmul(c2 % Q, CP[i]) for i in range(ROWS)])
+    Cy = (commit(zr, z) - cC) % Q
+    C0 = (commit(zt, pmul(sigma(z) % Q, z % Q)) - c2CP - cC1) % Q
+    if _nrm_hash(C, wt, CP, C1, Cy, C0) != pi["h"]:
+        return False
+    return ct_verify((CP - msg_only((wt * E0) % Q)) % Q, pi["ct"], reps)
+
+
+def norm_bytes(reps=REPS):
+    qb = math.ceil(math.log2(Q))
+    prod = (32 + 2 * ROWS * N * qb // 8 + N * qb // 8
+            + MU * N * math.ceil(math.log2(2 * NR_R)) // 8
+            + MU * N * math.ceil(math.log2(2 * NR_T)) // 8)
+    ct = reps * (N * qb + MU * N * math.ceil(math.log2(2 * RBOUND))) // 8 + 32
+    return prod, ct
+
+
+def lnp22_bytes():
+    """Size of a FAITHFUL LNP22 range proof AT THESE PARAMETERS.  Derived,
+    not quoted.  LNP22's own ~14 KB figures use q ~ 2^32; t_A alone is
+    kappa*N*log q, so our q = 2^57 dominates the total."""
+    qb = math.ceil(math.log2(Q))
+    l1 = 2 * (N // 4) + 1                  # ||c||_1 in the sigma-fixed subring
+    m1, m2 = 1, 10                         # bit vector; MLWE-hiding randomness
+    s1 = 11 * l1 * math.sqrt(N * m1)
+    s2 = 11 * l1 * math.sqrt(N * m2)
+    tA, tB = KAPPA * N * qb, 3 * N * qb
+    z1 = m1 * N * math.ceil(math.log2(6 * s1))
+    z2 = m2 * N * math.ceil(math.log2(6 * s2))
+    misc = 4 * N * qb
+    return (tA + tB + z1 + z2 + misc) // 8, tA // 8
+
+
+# ===========================================================================
 # 9b.  ML-KEM-768 (FIPS 203), complete -- no stub
 # ===========================================================================
 # Supplies the shared secret that lets a sender build a recipient's output
@@ -1614,6 +1884,10 @@ def t01_parameters():
     check("SIS: narrow ABDLOP binding", nar >= 128, f(nar, s5))
     check("SIS: Ajtai compressor collision resistance", ajt >= 128,
           f(ajt, s6) + " at the response bound it would compress")
+    nz1, _ = sis_bits(Q, ROWS, MU, N, 2 * NR_R * math.sqrt(N * MU))
+    nz2, _ = sis_bits(Q, ROWS, MU, N, 2 * NR_T * math.sqrt(N * MU))
+    check("SIS: norm-proof zr extraction", nz1 >= 128, f(nz1, False))
+    check("SIS: norm-proof zt extraction", nz2 >= 128, f(nz2, False))
     check("MLWE: narrow ABDLOP hiding", lwr >= 128,
           "%.0f bits, rank %d" % (lwr, MU_R - ROWS_R))
 
@@ -2535,6 +2809,115 @@ def t11_pow(rng):
     print("      arithmetic predicate a recursive verifier can express.")
 
 
+def t12_lnp22(rng):
+    hdr("T12.  LNP22 machinery: the parts that work, and the part that does not")
+
+    sub("Galois structure of R_q")
+    u = rng.integers(0, Q, size=N, dtype=np.int64)
+    want = np.zeros(N, dtype=np.int64)
+    want[0] = (N * int(u[0])) % Q
+    check("Tr(u) = N * ct(u) exactly", np.array_equal(trace(u), want),
+          "the full trace projects R_q onto Z_q")
+    bas = sigma_fixed_basis()
+    check("sigma-fixed subring is invariant and has dimension N/2",
+          len(bas) == N // 2
+          and all(np.array_equal(galois(e, SIGMA), e % Q) for e in bas),
+          "dimension %d, ample challenge space" % len(bas))
+    check("but the FULL group fixes only the scalars",
+          np.array_equal(trace(bas[1]), np.zeros(N, dtype=np.int64)),
+          "so a full-trace projection forces a scalar challenge again")
+
+    sub("why a ring challenge cannot enter the Hadamard relation")
+    b1, b2 = val_to_poly(12345), val_to_poly(54321)
+    rows = []
+    for _ in range(3):
+        c = np.zeros(N, dtype=np.int64)
+        idx = rng.choice(N, 40, replace=False)
+        c[idx] = rng.choice(np.array([-1, 1], dtype=np.int64), 40)
+        cb1 = pmul_tiny(c, b1) % Q
+        cb2 = pmul_tiny(c, b2) % Q
+        rows.append((cst_q(cb1, cb1), cst_q(b1, b1),
+                     cst_q(cb2, cb2), cst_q(b2, b2)))
+    r0 = rows[0]
+    prop = all((r[0] * r0[1]) % Q == (r0[0] * r[1]) % Q for r in rows)
+    check("<c.b,c.b> is NOT a c-only multiple of <b,b>", not prop,
+          "sigma(c)c is a ring element, so it reweights every coefficient")
+
+    sub("constant-coefficient proof -- a real LNP22 component, and sound")
+    rr = rand_r(rng)
+    m_ok = rng.integers(0, Q, size=N, dtype=np.int64)
+    m_ok[0] = 0
+    C_ok = commit(rr, m_ok)
+    t = time.time()
+    pi = ct_prove(rr, m_ok, rng, RT)
+    check("honest ct(m)=0 proof verifies", ct_verify(C_ok, pi, RT),
+          "%.1fs, %d attempts" % (time.time() - t, pi["tries"]))
+    m_bad = m_ok.copy()
+    m_bad[0] = 7
+    check("ct(m) != 0 cannot be proved",
+          not ct_verify(commit(rr, m_bad), ct_prove(rr, m_bad, rng, RT), RT))
+    check("proof is bound to its commitment",
+          not ct_verify(commit(rand_r(rng), m_ok), pi, RT))
+    check("declared repetition count is checked",
+          not ct_verify(C_ok, dict(pi, reps=1), 1))
+    check("soundness is LINEAR in x, so 1/XMAX per repetition",
+          REPS * math.log2(XMAX) >= 128,
+          "XMAX^-REPS = 2^-%.0f" % (REPS * math.log2(XMAX)))
+    check("ct_prove is NOT reachable from range_verify",
+          "ct_prove" not in RANGE_SRC and "ct_verify" not in RANGE_SRC,
+          "a component is not a licence to reduce REPS")
+
+    sub("what a faithful LNP22 range proof would cost at THIS q")
+    tot, tA = lnp22_bytes()
+    print("      total %d B (%.1f KB), of which t_A alone is %d B" 
+          % (tot, tot / 1024.0, tA))
+    print("      LNP22's own ~14 KB figures use q ~ 2^32.  Ours is 2^57,")
+    print("      forced by the balance argument (3*EXTRACT < q/2), and t_A =")
+    print("      kappa*N*log q scales with it.  The honest projection for this")
+    print("      design is ~%d KB, not the 15 KB quoted earlier." % round(tot / 1024))
+    check("the projection is derived from the parameters, not quoted",
+          20000 < tot < 45000, "%d B" % tot)
+
+
+def t13_norm(rng):
+    hdr("T13.  Exact norm proof <s,s> = wt, one shot, ring challenge")
+    s = val_to_poly(0b1011011)
+    wt = int(np.sum(s))
+    r = rand_r(rng)
+    C = commit(r, s)
+    t = time.time()
+    pi = norm_prove(r, s, wt, rng, RT)
+    check("honest <s,s> = %d proof produced" % wt, pi is not None,
+          "%.1fs, %d attempts" % (time.time() - t, pi["tries"] if pi else -1))
+    check("it verifies", norm_verify(C, wt, pi, RT))
+    check("a wrong weight is rejected", not norm_verify(C, wt + 1, pi, RT))
+    check("bound to its commitment",
+          not norm_verify(commit(rand_r(rng), s), wt, pi, RT))
+    check("tampered response rejected",
+          not norm_verify(C, wt, dict(pi, z=(pi["z"] + 1) % Q), RT))
+    check("tampered C_P rejected",
+          not norm_verify(C, wt, dict(pi, CP=(np.asarray(pi["CP"])
+                                              + msg_only(E0)) % Q), RT))
+    p2 = norm_prove(r, s, wt + 1, rng, RT)
+    check("a false weight cannot be proved honestly",
+          p2 is None or not norm_verify(C, wt + 1, p2, RT))
+    c = sigma_challenge(C, pi["CP"], pi["h"])
+    check("challenge is sigma-fixed and inside both caps",
+          np.array_equal(galois(c, SIGMA), c % Q)
+          and l1(c) <= NORM_L1 and l1(pmul_tiny(c, c)) <= NORM_L2,
+          "||c||_1 = %d, ||c^2||_1 = %d, min-entropy 2^-%d"
+          % (l1(c), l1(pmul_tiny(c, c)), N // 2))
+    prod, ctb = norm_bytes()
+    print("      product part %d B in ONE shot; ct(P)=wt part %d B at REPS=%d"
+          % (prod, ctb, REPS))
+    print("      The ring challenge removed the repetitions from the QUADRATIC")
+    print("      step.  It did not remove them from the constant-coefficient")
+    print("      step, which is now the whole cost: the prover picks the")
+    print("      garbage g, so ct(g) != 0 is only caught with probability")
+    print("      1/XMAX per shot, and XMAX is bounded because the garbage")
+    print("      commitment's randomness response must stay short.")
+
+
 def t10_sizes():
     hdr("T10.  Sizes and permanent state")
     qb = math.ceil(math.log2(Q))
@@ -2579,13 +2962,15 @@ def t10_sizes():
           % MU)
     print("      zr costs a recursive opening, i.e. another proof system.")
     print()
-    print("      With LNP22 range proofs at a projected 15 KB, the snapshot")
-    print("      column becomes %.2f TB and J=32 totals %.2f TB."
-          % (snap22, (ker / 32 + off / 60.) * 3.15e8 / 1e12 + snap22))
-    print("      Grin at the same volume is 0.04 TB.  The gap is the range")
-    print("      proof and nothing else; every other line is within 2 orders.")
-
-
+    lnp, lnp_tA = lnp22_bytes()
+    snap22 = (com + lnp + 32 + CT_BYTES + 8) * 1e7 / 1e12
+    print("      A faithful LNP22 range proof at THESE parameters is %d B"
+          % lnp)
+    print("      (derived in T12, not quoted): the snapshot column becomes")
+    print("      %.2f TB and J=32 totals %.2f TB.  Of that %d B is t_A ="
+          % (snap22, (ker / 32 + off / 60.) * 3.15e8 / 1e12 + snap22, lnp_tA))
+    print("      kappa*N*log q, so our q = 2^57 -- forced by the balance")
+    print("      argument -- is what puts it above LNP22's own ~14 KB.")
 def main():
     print("=" * 78)
     print("  LATTICE MIMBLEWIMBLE -- specification and validation suite")
@@ -2611,6 +2996,8 @@ def main():
     t08_chain(rng)
     t09_attacks(rng)
     t11_pow(rng)
+    t12_lnp22(rng)
+    t13_norm(rng)
     t10_sizes()
 
     hdr("Summary")
