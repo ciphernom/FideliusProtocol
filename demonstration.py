@@ -12,31 +12,10 @@ Exit code 0 iff every check passes.  Nothing is stubbed: ML-KEM-768 is
 implemented in full from FIPS 203 in section 9b.
 
 -----------------------------------------------------------------------------
-0.  WHAT THIS IS, AND WHAT CHANGED
+0.  WHAT THIS IS
 -----------------------------------------------------------------------------
 A confidential-transaction chain in the Mimblewimble shape -- commitments,
 excesses, kernels, cut-through -- built on Module-SIS instead of discrete log.
-
-Relative to earlier drafts of this design, the load-bearing changes are:
-
-  BALANCE IS NOW ACTUALLY PROVED.  Earlier versions argued balance from an
-  EXACT extraction that a Fiat-Shamir proof does not give.  What extraction
-  gives is Ahat*w_bar = chi_bar*E for a challenge difference chi_bar, and the
-  factor chi_bar was never chased.  Section 6 closes it: applying the ring
-  homomorphism Phi(u) = u(2) mod (2^256+1) turns the relaxed identity into
-  Phi(chi_bar)*val(d) = 0 mod F_8, and because F_8 = 2^256+1 factors as
-  f1*f2 with f2 prime and larger than any representable amount, val(d) = 0
-  follows unless f2 divides Phi(chi_bar) -- probability 2^-206.
-
-  NO BOUND IS EVER READ FROM A PROOF.  Every norm bound the verifier enforces
-  is derived at parameter time in section 1 and validated in T01.
-
-  EVERY PROOF DECLARES ITS SHAPE.  Repetition counts, list lengths, party
-  counts and challenge weights are all checked, because each was an exploit.
-
-  THE VERIFIER IS ARITHMETIC.  The Fiat-Shamir hash is a Rescue-style sponge
-  over R_q, not SHAKE, so a recursive verifier can express it.  This is the
-  weakest part of the design and is flagged as such in T01 and the summary.
 
 -----------------------------------------------------------------------------
 1.  PROTOCOL SPECIFICATION
