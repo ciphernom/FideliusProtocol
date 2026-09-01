@@ -1,4 +1,4 @@
-# FideliusProtocol
+# The Fidelius Protocol
  **A Lattice-Based Confidential UTXO Architecture with Asynchronous Addressing and State Cut-Through**
 
 Fidelius is a post-quantum evolution of the Mimblewimble transaction topology (commitments, excesses, kernels, cut-through) built entirely over Module-SIS. 
